@@ -1,177 +1,120 @@
-# Instalar Debian 13 (trixie) con btrfs + subvolúmenes, desde un Debian Live, para usar con sway
+# Instalación de Debian 13 (Trixie) con Btrfs + Sway
 
-Esta guía reemplaza al instalador gráfico de Debian. En vez de eso, arrancas
-un Debian Live (un sistema que corre desde el USB, sin instalar nada) y
-construyes el sistema final a mano, comando por comando, con
-**debootstrap**. Esto es necesario porque el instalador gráfico de Debian
-no permite definir subvolúmenes de btrfs personalizados — solo puedes
-elegir "usar btrfs" en general.
+Guía práctica, paso a paso, para instalar y dejar funcionando un escritorio Debian 13 con Btrfs, Sway y audio vía PipeWire. Cada fase se prueba en hardware real antes de pasar a la siguiente.
 
-Al final de esta guía tendrás un sistema Debian 13 mínimo (sin entorno
-gráfico) con btrfs y los subvolúmenes correctos ya separados desde el
-origen. Desde ahí, clonas tu repositorio `debian-sway-v2` y corres
-`./sway.sh` exactamente como ya tenías planeado — esa parte no cambia.
+**Estado de esta guía:** Fases 1-3 y 6-8 validadas en hardware real. Las Fases 4-5 tenían un problema de variables/`$PATH` que no sobrevivían un reingreso al chroot en una terminal nueva (ya corregido: cada fase ahora restaura `$PATH` y hace `source /root/instalacion.env` al inicio) — pendientes de re-validar con esta corrección. Las fases 9 a 13 (Bluetooth y demás integración de hardware, aplicaciones de escritorio, herramientas de gestión, personalización y verificación final) todavía no están desarrolladas y se añadirán en una próxima revisión.
 
-## Conceptos que necesitas entender antes de empezar
+**Nota de prioridad:** Bluetooth se dejó fuera de esta guía a propósito. Para el funcionamiento básico de la máquina, Internet importa más que Bluetooth, así que Bluetooth se atenderá junto con el resto de "integración de hardware" (Fase 9), *después* de tener ya red, escritorio y audio resueltos, no antes ni al mismo tiempo.
 
-**¿Qué es un subvolumen?** En un sistema de archivos tradicional (ext4,
-por ejemplo), si quieres que `/home` esté separado de `/`, necesitas una
-partición física distinta, con un tamaño fijo decidido de antemano. En
-btrfs, un subvolumen es distinto: es como una carpeta especial dentro del
-**mismo** espacio de almacenamiento, que el sistema trata como si fuera
-su propio sistema de archivos independiente para efectos de montaje y
-snapshots — pero **sin reservarle un tamaño fijo**. Todos los subvolúmenes
-dentro de la misma partición btrfs comparten el mismo espacio libre. Por
-eso no necesitas decidir "cuánto le doy a cada uno": btrfs lo resuelve
-dinámicamente.
+## Antes de empezar
 
-**¿Por qué separar `/home`, `/var/log`, etc. en sus propios subvolúmenes?**
-Porque Snapper (la herramienta que gestiona snapshots) toma snapshots
-**por subvolumen**. Si todo vive dentro de un solo subvolumen `@`, cada
-snapshot de tu sistema incluye también tus archivos personales, tus logs,
-tu caché, etc. — cosas que no quieres "revertir" cuando haces rollback de
-una actualización fallida. Separándolos, un rollback de `@` (el sistema)
-no toca lo que vive en los demás subvolúmenes.
+- Todos los comandos de las Fases 1 a 5 se ejecutan como `root`, dentro o fuera del chroot según se indique.
+- A partir de la Fase 6 (dentro del chroot todavía) y hasta la 8, sigues como `root` en el chroot. Ya arrancado el sistema instalado (fases futuras 9+), los comandos con `sudo` se ejecutan como usuario normal.
+- El usuario a crear (`dilusaper`, "Diego Salazar" en este documento) se define como variable editable en la Fase 5, igual que `$DISK` en la Fase 1. No necesitas buscar y reemplazar nada a mano en el resto del documento.
 
-**¿Qué subvolúmenes usaremos, y por qué cada uno?**
+### Si cierras la terminal a mitad de la instalación (antes de reiniciar)
 
-| Subvolumen | Se monta en | Por qué existe |
-|---|---|---|
-| `@` | `/` | El sistema operativo en sí: lo único que realmente quieres poder revertir |
-| `@home` | `/home` | Tus archivos personales no deben verse afectados si reviertes el sistema |
-| `@log` | `/var/log` | Si reviertes `/` tras un fallo, quieres conservar el registro de *qué* falló |
-| `@cache` | `/var/cache` | Datos descartables (cachés de apt, fuentes, miniaturas); separarlos aligera cada snapshot de `@` |
-| `@tmp` | `/var/tmp` | Igual que `@cache`: temporales que no aportan nada a un snapshot del sistema |
-| `@opt` | `/opt` | Software instalado manualmente fuera de apt (no lo confundas con tus `.deb`, esos van a `/usr`) |
-| `@spool` | `/var/spool` | Colas de impresión y tareas pendientes del sistema |
-| `@libvirt` | `/var/lib/libvirt` | Tus máquinas virtuales (con libvirt/QEMU/KVM) no inflarán cada snapshot de `@` |
-| `@respaldos` | `/home/Respaldado` (enlazado como `~/Respaldado`) | Carpeta de propósito general, con la misma estructura de subcarpetas que `home`, donde TÚ decides qué mover según lo que quieras proteger con snapshots (ver explicación abajo) |
+Cada fase, desde la 3 en adelante, empieza restaurando `$PATH` y haciendo `source /root/instalacion.env`. Ese archivo se crea en la Fase 2 y guarda `$DISK`, `$EFI_PART`, `$SWAP_PART`, `$ROOT_PART` (y desde la Fase 5, también `$USER_NAME`/`$FULL_NAME`). Esto es intencional: si el live-USB se reinicia, la terminal se cierra, o simplemente vuelves otro día, **no necesitas repetir la Fase 1 completa ni recordar tus variables**. Basta con:
 
-**Sobre `@respaldos` — por qué existe y cómo se usa:** dado que tus
-archivos personales superan los 200GB regularmente, activar snapshots
-sobre todo `@home` resultaría en historiales pesados, porque btrfs
-retiene los bloques viejos de cualquier archivo grande que cambie (no
-copia los 200GB completos en cada snapshot, pero sí acumula espacio real
-con archivos pesados que cambian seguido). En vez de que el sistema
-decida qué proteger por tipo de archivo, creamos un subvolumen
-**independiente**, montado en una ruta fija (`/home/Respaldado`, que no
-depende de ningún usuario en particular) y enlazado dentro de tu home
-como `~/Respaldado` para que lo veas como una carpeta normal. Dentro de
-ella puedes ir creando las subcarpetas que necesites según qué quieras
-proteger (`Respaldado/Documentos`, `Respaldado/Proyectos`, etc.). Solo
-este subvolumen tendrá snapshots automáticos — el resto de `/home` queda
-protegido de rollbacks de `@` (por estar en `@home`, ya separado), pero
-sin historial propio de snapshots, evitando el problema de espacio.
+1. Volver a montar los subvolúmenes y hacer el bind-mount de `/dev`, `/proc`, `/sys`, `/run` (repite los comandos de montaje de las Fases 2 y 3, sin repetir `mkfs`/`btrfs subvolume create`/`debootstrap`).
+2. Entrar de nuevo con `chroot /mnt /bin/bash`.
+3. Ejecutar `export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin && source /root/instalacion.env`.
+4. Continuar desde la fase donde ibas.
 
-**Importante:** los snapshots de `@respaldos` viven en el mismo disco
-físico que todo lo demás. Protegen contra errores de edición, borrados
-accidentales o corrupción de un archivo puntual — no contra una falla
-del disco completo. Para ese nivel de riesgo, una copia en otro medio
-(disco externo, nube, etc.) es la única protección real; eso queda fuera
-del alcance de este proyecto y a tu criterio.
+Los pasos 1-3 son exactamente los del **Apéndice de rescate** al final de esta guía — es la misma operación, solo que la haces antes del primer reinicio en vez de después.
 
-No usaremos un subvolumen `@swap`: ya tienes una **partición** de swap
-separada (no un archivo dentro de btrfs), que es más simple y funciona
-igual de bien para hibernación. La diferencia entre ambos métodos se
-explica al final de esta guía, en la sección "Apéndice: swap como
-partición vs. swap como archivo".
+### Sobre el disco: HDD/USB (`sdX`) vs NVMe (`nvme0nX`)
 
-No usaremos subvolúmenes para gestores de sesión gráficos (`@gdm3`,
-`@sddm`, `@lightdm`): esos existen para entornos de escritorio completos
-(GNOME, KDE, XFCE). Tú usas **greetd + tuigreet**, que es mucho más
-liviano y no tiene un directorio de estado equivalente que necesite
-aislarse.
+Los discos NVMe (y eMMC) nombran sus particiones con una `p` antes del número (`nvme0n1p1`), mientras que los discos SATA/USB no la usan (`sda1`). Para no tener que editar cada comando de la guía según el disco, en la Fase 1 se define una detección automática y tres variables (`$EFI_PART`, `$SWAP_PART`, `$ROOT_PART`) que se usan durante el resto del documento en vez de `${DISK}1`, `${DISK}2`, `${DISK}3`. Si cambias de un HDD de pruebas a tu NVMe real, solo tienes que cambiar el valor de `$DISK`; el resto de la guía no necesita ningún ajuste.
 
----
+------
 
-## Paso 1 — Arrancar el Debian Live y preparar las herramientas
+## Fase 1: Preparación del disco
 
-Arranca tu máquina (virtual o real) desde el **Debian 13 Live ISO**
-(no la ISO de instalación normal — necesitas la versión "Live", que es un
-sistema completo corriendo desde el USB). Cualquier edición Live sirve
-(GNOME, XFCE, etc.); la elección no afecta al sistema final, ya que no
-vamos a usar nada de su entorno gráfico, solo su terminal.
+### Objetivo
 
-Una vez en el entorno Live, abre una terminal y conviértete en root:
+Particionar el disco en EFI, swap y una partición Linux formateada en Btrfs.
 
-```bash
-sudo su
-```
+### Qué logra esta fase
 
-Identifica el disco de destino:
+Deja el disco listo con tres particiones: EFI (arranque), swap (hibernación) y Btrfs (sistema), usando variables que funcionan igual en HDD/USB que en NVMe.
+
+### Comandos a ejecutar
+
+Primero identifica tu disco (no forma parte del bloque a pegar, solo es diagnóstico):
 
 ```bash
 lsblk -p
+sudo su
 ```
 
-Esto lista todos los discos. Busca el que corresponde a tu disco real
-(en una VM normalmente aparece como `/dev/sda` o `/dev/vda`). Guárdalo en
-una variable para no tener que escribirlo cada vez:
+Ajusta esta variable a tu disco real antes de continuar (edítala, no la pegues tal cual):
 
 ```bash
-export DISK="/dev/sda"   # reemplaza por el disco correcto
+export DISK="/dev/sdX"
 ```
 
-**Advertencia:** todo lo que sigue borra completamente el disco indicado
-en `$DISK`. Verifica dos veces que sea el disco correcto antes de seguir.
-
-Instala la herramienta de particionado:
+El resto de este bloque ya se puede copiar y pegar sin más ediciones:
 
 ```bash
-apt update && apt install -y gdisk
+# Detecta si el disco necesita el sufijo "p" antes del número de partición
+# (NVMe/eMMC) o no (SATA/USB tipo sdX). A partir de aquí, toda la guía usa
+# $EFI_PART, $SWAP_PART y $ROOT_PART en vez de ${DISK}1/2/3.
+case "$DISK" in
+  *nvme*|*mmcblk*) PARTSEP="p" ;;
+  *)               PARTSEP=""  ;;
+esac
+export EFI_PART="${DISK}${PARTSEP}1"
+export SWAP_PART="${DISK}${PARTSEP}2"
+export ROOT_PART="${DISK}${PARTSEP}3"
+
+# Particionado GPT
+sgdisk -Z $DISK                                    # limpia tabla de particiones existente
+sgdisk -og $DISK                                   # crea tabla GPT nueva
+sgdisk -n 1::+1G   -t 1:ef00 -c 1:'EFI'   $DISK
+sgdisk -n 2::+24G  -t 2:8200 -c 2:'SWAP'  $DISK     # ajusta el tamaño según tu RAM si usarás hibernación
+sgdisk -n 3::      -t 3:8300 -c 3:'LINUX' $DISK
+
+# Formateo
+mkfs.fat -F32 -n EFI $EFI_PART
+mkswap -L SWAP $SWAP_PART
+mkfs.btrfs -f -L DEBIAN $ROOT_PART
 ```
 
----
+### Archivos modificados
 
-## Paso 2 — Particionar el disco (EFI + swap + raíz btrfs)
+Tabla de particiones de `$DISK`.
 
-A diferencia del artículo original (que solo crea EFI + raíz, dejando el
-swap para después como archivo), aquí creamos **tres particiones desde el
-inicio**, porque decidiste mantener el swap como partición clásica:
+### Cómo verificar
 
 ```bash
-# Borra el disco y crea una tabla GPT nueva
-sgdisk -Z $DISK
-sgdisk -og $DISK
-
-# Partición 1: EFI System Partition (512 MiB)
-sgdisk -n 1::+512M -t 1:ef00 -c 1:'EFI' $DISK
-
-# Partición 2: swap (1.5x tu RAM — ajusta el tamaño a tu caso)
-# Ejemplo para 8 GB de RAM: 1.5 x 8 = 12 GiB
-sgdisk -n 2::+12G -t 2:8200 -c 2:'SWAP' $DISK
-
-# Partición 3: raíz btrfs (todo el espacio restante)
-sgdisk -n 3:: -t 3:8300 -c 3:'LINUX' $DISK
-
-# Formatea EFI como FAT32
-mkfs.fat -F32 -n EFI ${DISK}1
-
-# Prepara la partición de swap
-mkswap -L SWAP ${DISK}2
-
-# Formatea la raíz como btrfs
-mkfs.btrfs -L DEBIAN ${DISK}3
-
-# Verifica que todo quedó como esperas
-lsblk -po name,size,fstype,fsver,label,uuid $DISK
+lsblk -f $DISK
 ```
 
-Nota el cambio respecto al artículo original: como ahora la partición
-raíz es la **tercera** (no la segunda, porque insertamos el swap en medio),
-todas las referencias a `${DISK}2` que verás en guías genéricas pasan a
-ser `${DISK}3` en nuestro caso. Ya está ajustado en los comandos de esta
-guía — solo es importante que lo notes si comparas con otras fuentes.
+Deberías ver las tres particiones con sus labels (`EFI`, `SWAP`, `DEBIAN`) y sistemas de archivos correctos.
 
----
+### Problemas comunes
 
-## Paso 3 — Crear los subvolúmenes de btrfs
+- Si `echo $EFI_PART` no coincide con lo que ves en `lsblk -p` (por ejemplo, un disco poco común que no sea ni `sdX` ni `nvme`/`mmcblk`), ajusta `PARTSEP` manualmente antes de continuar.
+
+------
+
+## Fase 2: Subvolúmenes Btrfs
+
+### Objetivo
+
+Crear el layout de subvolúmenes y montarlos en su ubicación final.
+
+### Qué logra esta fase
+
+Separa `/`, `/home`, `/var/log`, `/var/cache`, `/var/tmp`, `/opt`, `/var/spool` y `/var/lib/libvirt` en subvolúmenes independientes, lo que facilita snapshots selectivos más adelante (Snapper solo necesita snapshotear `@` y `@home`).
+
+### Comandos a ejecutar
 
 ```bash
-# Monta la raíz btrfs (sin subvol todavía, accedemos al nivel superior)
-mount -v ${DISK}3 /mnt
+mount -v $ROOT_PART /mnt
 
-# Crea cada subvolumen según la tabla explicada arriba
+# Subvolúmenes
 btrfs subvolume create /mnt/@
 btrfs subvolume create /mnt/@home
 btrfs subvolume create /mnt/@log
@@ -180,87 +123,129 @@ btrfs subvolume create /mnt/@tmp
 btrfs subvolume create /mnt/@opt
 btrfs subvolume create /mnt/@spool
 btrfs subvolume create /mnt/@libvirt
-btrfs subvolume create /mnt/@respaldos
 
-# Desmonta; ya cumplió su propósito (crear la estructura)
-umount -v /mnt
-```
+umount -vR /mnt
 
----
-
-## Paso 4 — Montar los subvolúmenes en su disposición final
-
-```bash
-# Opciones de montaje: noatime evita escrituras innecesarias al leer
-# archivos; space_cache=v2 mejora el rendimiento del propio btrfs;
-# compress=zstd:1 comprime de forma transparente y barata en CPU.
-BTRFS_OPTS="defaults,noatime,space_cache=v2,compress=zstd:1"
-
-# Monta la raíz (subvolumen @)
-mount -vo $BTRFS_OPTS,subvol=@ ${DISK}3 /mnt
-
-# Crea los puntos de montaje para los demás subvolúmenes
+export BTRFS_OPTS="defaults,noatime,space_cache=v2,compress=zstd:1"
+mount -vo $BTRFS_OPTS,subvol=@ $ROOT_PART /mnt
 mkdir -vp /mnt/{home,opt,boot/efi,var/{cache,lib/libvirt,log,spool,tmp}}
 
-# Monta @home PRIMERO, porque /home/Respaldado debe existir dentro de
-# @home ya montado (si creas la carpeta antes de montar @home, la
-# carpeta quedaría "perdida" debajo del subvolumen, no dentro de él)
-mount -vo $BTRFS_OPTS,subvol=@home ${DISK}3 /mnt/home
-mkdir -vp /mnt/home/Respaldado
+# Persiste las variables de disco en el propio sistema de destino. Al estar
+# dentro de /mnt, sobrevive a que cierres esta terminal, reinicies el live-USB,
+# o entres al chroot en otro momento: dentro del chroot esto será /root/instalacion.env.
+mkdir -vp /mnt/root
+cat > /mnt/root/instalacion.env << EOF
+export DISK="$DISK"
+export PARTSEP="$PARTSEP"
+export EFI_PART="$EFI_PART"
+export SWAP_PART="$SWAP_PART"
+export ROOT_PART="$ROOT_PART"
+export BTRFS_OPTS="$BTRFS_OPTS"
+EOF
 
-# Monta el resto de subvolúmenes en su carpeta correspondiente
-mount -vo $BTRFS_OPTS,subvol=@opt       ${DISK}3 /mnt/opt
-mount -vo $BTRFS_OPTS,subvol=@cache     ${DISK}3 /mnt/var/cache
-mount -vo $BTRFS_OPTS,subvol=@libvirt   ${DISK}3 /mnt/var/lib/libvirt
-mount -vo $BTRFS_OPTS,subvol=@log       ${DISK}3 /mnt/var/log
-mount -vo $BTRFS_OPTS,subvol=@spool     ${DISK}3 /mnt/var/spool
-mount -vo $BTRFS_OPTS,subvol=@tmp       ${DISK}3 /mnt/var/tmp
-mount -vo $BTRFS_OPTS,subvol=@respaldos ${DISK}3 /mnt/home/Respaldado
-
-# Monta la partición EFI
-mount -v ${DISK}1 /mnt/boot/efi
-
-# Verifica el resultado
-lsblk -po name,size,fstype,uuid,mountpoints $DISK
+mount -vo $BTRFS_OPTS,subvol=@home    $ROOT_PART /mnt/home
+mount -vo $BTRFS_OPTS,subvol=@opt     $ROOT_PART /mnt/opt
+mount -vo $BTRFS_OPTS,subvol=@cache   $ROOT_PART /mnt/var/cache
+mount -vo $BTRFS_OPTS,subvol=@libvirt $ROOT_PART /mnt/var/lib/libvirt
+mount -vo $BTRFS_OPTS,subvol=@log     $ROOT_PART /mnt/var/log
+mount -vo $BTRFS_OPTS,subvol=@spool   $ROOT_PART /mnt/var/spool
+mount -vo $BTRFS_OPTS,subvol=@tmp     $ROOT_PART /mnt/var/tmp
+mount -v $EFI_PART /mnt/boot/efi
 ```
 
-No montamos el swap aquí: una partición de swap no se "monta" en una
-carpeta, se activa más adelante con `swapon` (Paso 9).
+### Archivos modificados
 
----
+Ninguno fuera de `/mnt` (aún no es el sistema final).
 
-## Paso 5 — Instalar el sistema base con debootstrap
+### Cómo verificar
 
 ```bash
-apt install -y debootstrap
+mount | grep /mnt
+btrfs subvolume list /mnt
+cat /mnt/root/instalacion.env
+```
 
-# Instala el sistema base mínimo de Debian 13 dentro de /mnt
+Deben aparecer los 8 subvolúmenes, todos los puntos de montaje bajo `/mnt`, y las cuatro variables con valores no vacíos (si alguna sale vacía aquí, corrígela ahora — es mucho más fácil que descubrirlo en la Fase 4).
+
+### Problemas comunes
+
+- Si olvidas `umount -vR /mnt` antes de remontar con subvolúmenes, el segundo `mount` de `@` puede fallar o montar el top-level en vez del subvolumen.
+
+------
+
+## Fase 3: Bootstrap de Debian
+
+### Objetivo
+
+Instalar el sistema base de Debian con `debootstrap` y entrar al chroot.
+
+### Qué logra esta fase
+
+Deja un sistema Debian mínimo instalado en `/mnt`, listo para configurarse desde dentro (chroot).
+
+### Comandos a ejecutar
+
+```bash
 debootstrap --arch=amd64 trixie /mnt http://deb.debian.org/debian
 
-# Monta los sistemas de archivos especiales necesarios para usar chroot
 for dir in dev proc sys run; do
     mount -v --rbind "/${dir}" "/mnt/${dir}"
     mount -v --make-rslave "/mnt/${dir}"
 done
-
-# Monta las variables EFI (necesario para sistemas UEFI)
 mount -v -t efivarfs efivarfs /mnt/sys/firmware/efi/efivars
+
+chroot /mnt /bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export LANG=en_US.UTF-8
+source /root/instalacion.env
 ```
 
----
+### Archivos modificados
 
-## Paso 6 — Configurar `/etc/fstab`
+Todo el árbol de `/mnt` (nuevo sistema Debian).
 
-`fstab` es el archivo que le dice al sistema, en cada arranque, qué
-montar y dónde. Como tenemos nueve subvolúmenes más la partición EFI y el
-swap, cada uno necesita su propia línea:
+### Cómo verificar
 
 ```bash
-BTRFS_UUID=$(blkid -s UUID -o value ${DISK}3) ; echo $BTRFS_UUID
-EFI_UUID=$(blkid -s UUID -o value ${DISK}1)   ; echo $EFI_UUID
-SWAP_UUID=$(blkid -s UUID -o value ${DISK}2)  ; echo $SWAP_UUID
+whoami          # debe responder "root"
+cat /etc/debian_version
+echo "$ROOT_PART / $EFI_PART / $SWAP_PART"   # no debe salir vacío
+```
 
-cat > /mnt/etc/fstab << EOF
+### Problemas comunes
+
+- Si `debootstrap` falla a mitad de camino por red, vuelve a ejecutarlo: es reanudable.
+- Las tres líneas después de `chroot` (`export PATH`, `export LANG`, `source /root/instalacion.env`) son las que garantizan que las Fases 4 a 8 funcionen aunque hayas cerrado la terminal antes de llegar aquí. **No te las saltes**, incluso si crees que las variables ya estaban puestas: no cuesta nada repetirlas y es la causa más común de que `blkid`, `swapon`, `useradd` o `grub-install` fallen más adelante con la partición vacía o con "command not found".
+
+------
+
+## Fase 4: Sistema base
+
+### Objetivo
+
+Configurar identidad del sistema (hostname, fstab, timezone, locale, teclado) e instalar el kernel y las herramientas base.
+
+### Qué logra esta fase
+
+Deja un sistema arrancable con el idioma y teclado correctos, fstab consistente con los subvolúmenes de la Fase 2, y el kernel + Btrfs + GRUB instalados. La red se configura en la Fase 6 (justo después de tener usuario y bootloader), no aquí, para mantener esta fase enfocada en lo estrictamente base.
+
+### Comandos a ejecutar
+
+```bash
+# Por si volviste a entrar al chroot en una terminal nueva: restaura PATH y variables
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+source /root/instalacion.env
+
+BTRFS_UUID=$(blkid -s UUID -o value $ROOT_PART)
+EFI_UUID=$(blkid -s UUID -o value $EFI_PART)
+SWAP_UUID=$(blkid -s UUID -o value $SWAP_PART)
+
+# Corta aquí en vez de escribir un fstab con UUID= vacío si algo salió mal arriba
+for v in BTRFS_UUID EFI_UUID SWAP_UUID; do
+    [ -z "${!v}" ] && { echo "ERROR: $v está vacío. Revisa \$ROOT_PART/\$EFI_PART/\$SWAP_PART antes de seguir."; return 1 2>/dev/null || exit 1; }
+done
+
+cat > /etc/fstab << EOF
 UUID=$BTRFS_UUID /                btrfs defaults,noatime,space_cache=v2,compress=zstd:1,subvol=@ 0 0
 UUID=$BTRFS_UUID /home            btrfs defaults,noatime,space_cache=v2,compress=zstd:1,subvol=@home 0 0
 UUID=$BTRFS_UUID /opt             btrfs defaults,noatime,space_cache=v2,compress=zstd:1,subvol=@opt 0 0
@@ -269,66 +254,39 @@ UUID=$BTRFS_UUID /var/lib/libvirt btrfs defaults,noatime,space_cache=v2,compress
 UUID=$BTRFS_UUID /var/log         btrfs defaults,noatime,space_cache=v2,compress=zstd:1,subvol=@log 0 0
 UUID=$BTRFS_UUID /var/spool       btrfs defaults,noatime,space_cache=v2,compress=zstd:1,subvol=@spool 0 0
 UUID=$BTRFS_UUID /var/tmp         btrfs defaults,noatime,space_cache=v2,compress=zstd:1,subvol=@tmp 0 0
-UUID=$BTRFS_UUID /home/Respaldado btrfs defaults,noatime,space_cache=v2,compress=zstd:1,subvol=@respaldos 0 0
 UUID=$EFI_UUID   /boot/efi        vfat  defaults,noatime 0 2
 UUID=$SWAP_UUID  none             swap  defaults 0 0
 EOF
 
-cat /mnt/etc/fstab
-```
-
-**Nota sobre el orden de montaje:** no es necesario preocuparte por el
-orden exacto de las líneas en `fstab`. Como `/home/Respaldado` está
-literalmente dentro de la ruta de `/home`, systemd detecta esa jerarquía
-automáticamente y garantiza que `/home` se monte antes que
-`/home/Respaldado` en cada arranque, sin necesidad de ninguna opción
-adicional.
-
----
-
-## Paso 7 — Entrar al sistema instalado (chroot)
-
-```bash
-chroot /mnt /bin/bash
-```
-
-A partir de aquí, todos los comandos se ejecutan **dentro** del sistema
-nuevo, como si ya hubieras arrancado en él.
-
----
-
-## Paso 8 — Configuración básica del sistema
-
-```bash
-# Nombre del equipo (cámbialo si quieres otro)
 echo "debian" > /etc/hostname
 
 cat > /etc/hosts << EOF
 127.0.0.1       localhost
-127.0.1.1       $(cat /etc/hostname)
+127.0.1.1       debian
 
 ::1             localhost ip6-localhost ip6-loopback
 ff02::1         ip6-allnodes
 ff02::2         ip6-allrouters
 EOF
 
-# Zona horaria — ajusta a tu ubicación real
 ln -sf /usr/share/zoneinfo/America/Bogota /etc/localtime
 
-# Configuración regional (idioma del sistema)
-apt install -y locales
-dpkg-reconfigure locales
-```
+apt update
+apt install -y locales console-setup
 
-Cuando `dpkg-reconfigure locales` te muestre la lista, marca la que
-corresponda a tu idioma (por ejemplo `es_CO.UTF-8` o `en_US.UTF-8`,
-según prefieras) y elige esa misma como predeterminada al final.
+sed -i 's/^# *\(en_US.UTF-8\)/\1/' /etc/locale.gen
+locale-gen
+echo "LANG=en_US.UTF-8" > /etc/default/locale
 
----
+cat > /etc/default/keyboard << EOF
+XKBMODEL="pc105"
+XKBLAYOUT="us"
+XKBVARIANT="intl"
+XKBOPTIONS=""
+BACKSPACE="guess"
+EOF
+setupcon
 
-## Paso 9 — Repositorios, paquetes base, y activar el swap
-
-```bash
 cat > /etc/apt/sources.list << EOF
 deb http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
 deb-src http://deb.debian.org/debian trixie main contrib non-free non-free-firmware
@@ -342,32 +300,50 @@ EOF
 
 apt update
 
-# Kernel, firmware, GRUB, red, herramientas básicas
+# Kernel, firmware genérico y herramientas base (la red se instala en la Fase 6)
 apt install -y linux-image-amd64 linux-headers-amd64 \
     firmware-linux firmware-linux-nonfree \
-    grub-efi-amd64 efibootmgr network-manager \
+    grub-efi-amd64 efibootmgr \
     btrfs-progs sudo vim bash-completion
 
-# Activa el swap definido en fstab
 swapon -a
-swapon -v
 ```
 
----
+### Archivos modificados
 
-## Paso 10 — Hibernación con swap en partición
+`/etc/fstab`, `/etc/hostname`, `/etc/hosts`, `/etc/localtime`, `/etc/locale.gen`, `/etc/default/locale`, `/etc/default/keyboard`, `/etc/apt/sources.list`.
 
-Esta es la parte que cambia respecto al artículo original (que usaba un
-archivo de swap dentro de btrfs, con su propio cálculo de "offset"). Con
-una **partición** de swap, el procedimiento es más directo: el kernel solo
-necesita saber el UUID de la partición, sin offsets adicionales.
+### Cómo verificar
 
 ```bash
-# Verifica que Secure Boot esté deshabilitado (la hibernación lo requiere)
-# Si no tienes mokutil instalado todavía, sáltate esta verificación por
-# ahora y revísalo desde la BIOS/UEFI de tu máquina directamente.
+locale
+cat /etc/fstab
+dpkg -l | grep linux-image
+```
 
-SWAP_UUID=$(blkid -s UUID -o value ${DISK}2)
+### Problemas comunes
+
+- Si `locale-gen` no genera `en_US.UTF-8`, revisa que la línea en `/etc/locale.gen` haya quedado descomentada.
+
+------
+
+## Fase 5: Usuario, hibernación y GRUB
+
+### Objetivo
+
+Configurar hibernación, crear el usuario y dejar GRUB instalado y arrancable.
+
+### Qué logra esta fase
+
+Al reiniciar, el sistema arranca directo a Debian con GRUB, con un usuario funcional con permisos de `sudo`, y con la hibernación apuntando correctamente a la partición swap.
+
+### Comandos a ejecutar
+
+```bash
+# Por si volviste a entrar al chroot en una terminal nueva: restaura PATH y variables
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+source /root/instalacion.env
+
 echo "GRUB_CMDLINE_LINUX_DEFAULT=\"quiet resume=UUID=$SWAP_UUID\"" >> /etc/default/grub
 
 cat > /etc/initramfs-tools/conf.d/resume << EOF
@@ -375,132 +351,366 @@ RESUME=UUID=$SWAP_UUID
 EOF
 
 update-initramfs -u -k all
-```
 
-(El `update-grub` que aplica esto se ejecuta en el Paso 12, después de
-instalar GRUB.)
+# Ajusta estos dos valores a tu nombre y usuario reales (igual que $DISK en la Fase 1)
+export FULL_NAME="Diego Salazar"
+export USER_NAME="dilusaper"
 
----
+# Se guardan junto al resto de variables para que las Fases 7 y 8 (y cualquier
+# reingreso al chroot) los recuerden sin que tengas que volver a escribirlos
+cat >> /root/instalacion.env << EOF
+export FULL_NAME="$FULL_NAME"
+export USER_NAME="$USER_NAME"
+EOF
 
-## Paso 11 — Crear tu usuario
-
-```bash
-# Reemplaza "tu_usuario" y "Tu Nombre" con tus datos reales
-useradd -m -G sudo,adm,libvirt -s /bin/bash -c "Tu Nombre" tu_usuario
-passwd tu_usuario
-id tu_usuario
-
-# Enlaza la carpeta de respaldos (subvolumen @respaldos, montado en
-# /home/Respaldado) dentro del home del usuario, para que la veas como
-# ~/Respaldado igual que cualquier otra carpeta normal.
-ln -s /home/Respaldado /home/tu_usuario/Respaldado
-chown -h tu_usuario:tu_usuario /home/tu_usuario/Respaldado
-
-# Dentro de ~/Respaldado, crea las subcarpetas que vayas necesitando,
-# calcando la estructura de tu home, según qué quieras proteger con
-# snapshots (ejemplo de inicio, ajusta a tu gusto):
-mkdir -p /home/Respaldado/{Documentos,Proyectos}
-chown -R tu_usuario:tu_usuario /home/Respaldado
-```
-
-Nota: se agregó el grupo `libvirt` al usuario en este paso, ya que
-mencionaste que usarás libvirt/QEMU/KVM para tus máquinas virtuales —
-sin pertenecer a ese grupo, no podrías gestionarlas sin `sudo` en cada
-comando.
-
-```bash
-# 1. Crear el grupo libvirt manualmente para que useradd no proteste
 groupadd libvirt
+useradd -m -G sudo,adm,libvirt -s /bin/bash -c "$FULL_NAME" $USER_NAME
+passwd $USER_NAME
 
-# 2. Crear tu usuario (reemplaza "tu_usuario" y "Tu Nombre" con tus datos reales)
-useradd -m -G sudo,adm,libvirt -s /bin/bash -c "Tu Nombre" tu_usuario
-
-# 3. Asignar la contraseña a tu nuevo usuario
-passwd tu_usuario
-
-# 4. Crear el enlace simbólico hacia el subvolumen de respaldos
-ln -s /home/Respaldado /home/tu_usuario/Respaldado
-chown -h tu_usuario:tu_usuario /home/tu_usuario/Respaldado
-
-# 5. Crear las subcarpetas internas y ajustar permisos finales de la ruta completa
-mkdir -p /home/Respaldado/{Documentos,Proyectos}
-chown -R tu_usuario:tu_usuario /home/Respaldado
-```
-
----
-
-## Paso 12 — Instalar y configurar GRUB
-
-```bash
 grub-install \
   --target=x86_64-efi \
   --efi-directory=/boot/efi \
   --bootloader-id=debian \
+  --removable \
   --recheck
 
 update-grub
 ```
 
----
+### Archivos modificados
 
-## Paso 13 — Salir y reiniciar
+`/etc/default/grub`, `/etc/initramfs-tools/conf.d/resume`, `/boot/grub/grub.cfg`, `/etc/passwd` (nuevo usuario).
+
+### Cómo verificar
 
 ```bash
-exit                    # Sale del chroot
-umount -vR /mnt         # Desmonta todo
+grep resume /etc/default/grub
+id $USER_NAME
+ls /boot/efi/EFI
+```
+
+### Problemas comunes
+
+- Si `grub-install` se queja de no encontrar `/boot/efi`, confirma que se montó en la Fase 2.
+- Si `useradd`/`groupadd`/`grub-install`/`update-grub`/`update-initramfs` dan "command not found" aunque los paquetes estén instalados, tu `$PATH` no tiene `/sbin`/`/usr/sbin` en esta sesión: repite el `export PATH=...` del inicio de este bloque (revisa también que no hayas saltado el `source /root/instalacion.env` de la Fase 3).
+
+------
+
+## Fase 6: Redes (Internet)
+
+### Objetivo
+
+Dejar la conectividad de red (cableada y Wi-Fi) funcionando mediante NetworkManager, antes de instalar nada gráfico.
+
+### Qué logra esta fase
+
+Garantiza que la máquina instalada tenga Internet apenas arranque, incluso si por algún motivo las fases siguientes (escritorio, audio, etc.) quedaran a medias. Usa el firmware `iwlwifi` para tarjetas Intel.
+
+### Comandos a ejecutar
+
+```bash
+# Por si volviste a entrar al chroot en una terminal nueva: restaura PATH y variables
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+source /root/instalacion.env
+
+apt install -y network-manager wpasupplicant wireless-tools rfkill \
+               firmware-iwlwifi
+
+systemctl enable NetworkManager
+```
+
+### Archivos modificados
+
+Ninguno relevante; NetworkManager gestiona su propia configuración en `/etc/NetworkManager/`.
+
+### Cómo verificar
+
+Tras el primer arranque (ver el corte "hasta aquí desde el live" más adelante):
+
+```bash
+nmcli device status
+nmcli device wifi list
+sudo nmtui   # conectar a una red desde una interfaz de texto simple
+ping -c3 deb.debian.org
+```
+
+### Problemas comunes
+
+- Si tu tarjeta Wi-Fi no aparece en `nmcli device status`, tu chipset puede necesitar un paquete de firmware distinto a `firmware-iwlwifi` (por ejemplo `firmware-realtek` o `firmware-atheros`); revisa el modelo con `lspci -k | grep -A3 -i network`.
+- Si `rfkill list` muestra el Wi-Fi bloqueado por software, usa `rfkill unblock wifi`.
+
+------
+
+## Fase 7: Primer escritorio gráfico y navegador
+
+### Objetivo
+
+Instalar Sway, LightDM y Firefox ESR: lo mínimo necesario para tener un escritorio gráfico funcional, con acceso a Internet vía navegador, desde el cual continuar el resto de la instalación cómodamente.
+
+### Qué logra esta fase
+
+No es el escritorio final: es un punto de apoyo. Con esto ya puedes iniciar sesión gráficamente, navegar a GitHub para consultar el resto de tus notas/repositorios, y seguir instalando desde ahí en vez de depender de la consola o del chroot. También se establece la estructura modular de configuración (`config.d/`) que usarán las fases siguientes.
+
+### Comandos a ejecutar
+
+```bash
+# Por si volviste a entrar al chroot en una terminal nueva: restaura PATH y variables
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+source /root/instalacion.env
+
+apt install -y sway xwayland swaybg swaylock swayidle \
+               brightnessctl upower acpi \
+               libinput-tools pciutils usbutils \
+               lightdm lightdm-gtk-greeter \
+               firefox-esr
+
+systemctl enable lightdm.service
+
+# Estructura modular de configuración de Sway
+mkdir -p /home/$USER_NAME/.config/sway/config.d
+
+cat > /home/$USER_NAME/.config/sway/config << 'EOF'
+# Config principal: conserva los atajos por defecto de Sway/Debian
+# y añade las personalizaciones propias en config.d/
+include /etc/sway/config
+
+include config.d/*.conf
+EOF
+
+cat > /home/$USER_NAME/.config/sway/config.d/variables.conf << 'EOF'
+# Variables reutilizables por el resto de los archivos de config.d/
+set $mod Mod4
+EOF
+
+cat > /home/$USER_NAME/.config/sway/config.d/inputs.conf << 'EOF'
+# Teclado en inglés con AltGr para acentos (intl)
+input * {
+    xkb_layout "us"
+    xkb_variant "intl"
+}
+EOF
+
+cat > /home/$USER_NAME/.config/sway/config.d/outputs.conf << 'EOF'
+# Configuración específica de monitores (resolución, escala, posición).
+# Lista tus salidas con "wlr-randr" (Fase 8) y ajusta aquí según tu hardware.
+EOF
+
+cat > /home/$USER_NAME/.config/sway/config.d/bindings.conf << 'EOF'
+# Atajos de teclado propios. Los de multimedia se añaden en la Fase 8.
+EOF
+
+cat > /home/$USER_NAME/.config/sway/config.d/appearance.conf << 'EOF'
+# Tema Nord y apariencia general. Se completará en la fase de personalización.
+EOF
+
+cat > /home/$USER_NAME/.config/sway/config.d/autostart.conf << 'EOF'
+# Aplicaciones que deben iniciar junto con la sesión (Waybar, etc.)
+# Se completará en la fase de aplicaciones de escritorio.
+EOF
+
+cat > /home/$USER_NAME/.config/sway/config.d/idle.conf << 'EOF'
+# Prueba rápida de gestión de energía (ajustar tiempos reales más adelante):
+# Suspender a los 60s, hibernar a los 120s
+exec swayidle -w \
+    timeout 60  'systemctl suspend' \
+    timeout 120 'systemctl hibernate'
+EOF
+
+chown -R $USER_NAME:$USER_NAME /home/$USER_NAME/.config
+```
+
+### Archivos modificados
+
+`~/.config/sway/config` y `~/.config/sway/config.d/*.conf` (nuevos).
+
+### Cómo verificar
+
+Tras reiniciar, inicia sesión en LightDM eligiendo la sesión Sway. Deberías obtener un escritorio Sway vacío pero funcional, con el teclado en layout `us intl`, y poder abrir Firefox ESR desde una terminal (`firefox-esr &`) para navegar (usa la red configurada en la Fase 6).
+
+### Problemas comunes
+
+- Si LightDM no lista Sway como sesión, confirma que exista `/usr/share/wayland-sessions/sway.desktop` (lo instala el paquete `sway`).
+- Si `include /etc/sway/config` da error porque el archivo fue modificado por otro paquete, revisa la ruta con `cat /etc/sway/config`.
+
+------
+
+## Fase 8: Audio, pantallas y teclado retroiluminado
+
+### Objetivo
+
+Dejar el audio completamente funcional a nivel de usuario, con pavucontrol como control gráfico, manejo básico de pantallas, y atajos de teclado seguros para volumen, mute de micrófono, brillo y retroiluminación del teclado.
+
+### Qué logra esta fase
+
+Instala PipeWire/WirePlumber junto con los componentes que, en pruebas sobre hardware real, resultaron necesarios para que el audio efectivamente se conecte a la sesión del usuario (bus de sesión, permisos de tiempo real y firmware/config de ALSA). Todo esto se hace todavía dentro del chroot: en vez de reiniciar servicios de usuario (lo cual no funciona sin una sesión real activa), se usa `systemctl --global enable`, que sí funciona sin sesión y deja los servicios listos para arrancar solos en el primer login real. También añade atajos multimedia que usan la lógica nativa de PipeWire (`wpctl`, no `pactl`), con un límite de volumen del 175% (en vez de 100%, para altavoces flojos) y un mínimo de brillo del 1% (para que la pantalla nunca se apague del todo).
+
+### Comandos a ejecutar
+
+```bash
+# Por si volviste a entrar al chroot en una terminal nueva: restaura PATH y variables
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+source /root/instalacion.env
+
+apt install -y pipewire wireplumber pipewire-pulse \
+               dbus-user-session rtkit libpam-systemd \
+               alsa-utils alsa-ucm-conf alsa-topology-conf firmware-sof-signed \
+               pavucontrol \
+               wlr-randr
+# El usuario debe poder leer/escribir brillo sin sudo
+usermod -aG video $USER_NAME
+# Habilita los servicios de usuario de PipeWire para TODOS los usuarios,
+# sin necesitar una sesión activa (no funciona "--user restart" en chroot).
+# Al hacer login por primera vez tras reiniciar, ya arrancarán solos.
+systemctl --global enable pipewire wireplumber pipewire-pulse
+# Atajos multimedia, con límites para evitar los problemas conocidos:
+# - wpctl con "-l 1.75" permite subir hasta 175% (ajusta a 2.0 = 200% si aún te
+#   quedas corto de volumen; recuerda bajarlo tú mismo en espacios silenciosos).
+# - brightnessctl con "--min-value=1" evita apagar la pantalla al bajar el brillo.
+# - El nombre de dispositivo "tpacpi::kbd_backlight" es el habitual en ThinkPad
+#   (driver thinkpad_acpi). Confirma con "brightnessctl -l" (Fase 8, verificación);
+#   si tu equipo muestra otro nombre bajo la categoría "leds", ajústalo aquí.
+#   Nota: en muchos ThinkPad, Fn+Espacio cicla el brillo del teclado directo por
+#   firmware/EC, sin pasar por Sway, así que debería seguir funcionando igual
+#   independientemente de este atajo (que es solo una vía alterna).
+cat >> /home/$USER_NAME/.config/sway/config.d/bindings.conf << 'EOF'
+
+# --- Multimedia: audio (PipeWire vía wpctl) ---
+bindsym XF86AudioRaiseVolume exec wpctl set-volume -l 1.75 @DEFAULT_AUDIO_SINK@ 5%+
+bindsym XF86AudioLowerVolume exec wpctl set-volume @DEFAULT_AUDIO_SINK@ 5%-
+bindsym XF86AudioMute        exec wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle
+bindsym XF86AudioMicMute     exec wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle
+
+# --- Multimedia: brillo de pantalla ---
+bindsym XF86MonBrightnessUp   exec brightnessctl set 5%+
+bindsym XF86MonBrightnessDown exec brightnessctl set 5%- --min-value=1
+
+# --- Multimedia: retroiluminación del teclado (ThinkPad: tpacpi::kbd_backlight) ---
+bindsym XF86KbdBrightnessUp   exec brightnessctl -d tpacpi::kbd_backlight set 10%+
+bindsym XF86KbdBrightnessDown exec brightnessctl -d tpacpi::kbd_backlight set 10%-
+EOF
+
+chown $USER_NAME:$USER_NAME /home/$USER_NAME/.config/sway/config.d/bindings.conf
+```
+
+### Archivos modificados
+
+`~/.config/sway/config.d/bindings.conf` (atajos multimedia añadidos).
+
+### Cómo verificar
+
+Después de reiniciar y hacer login gráfico:
+
+```bash
+# Servicios de usuario activos (deberían arrancar solos por el --global enable)
+systemctl --user status pipewire wireplumber pipewire-pulse
+
+# El audio ve un sink y una fuente por defecto
+wpctl status
+
+# Prueba de sonido
+speaker-test -c2 -twav -l1
+
+# Control gráfico de volumen
+pavucontrol
+
+# Salidas de pantalla detectadas
+wlr-randr
+```
+
+Prueba las teclas de volumen/brillo/retroiluminación:
+
+- El volumen no debe superar el 175% aunque mantengas presionada la tecla de subir.
+- El brillo no debe llegar a 0% aunque mantengas presionada la tecla de bajar.
+
+### Problemas comunes
+
+- Si tras el primer login `systemctl --user status pipewire` no aparece activo, ejecútalo manualmente una vez: `systemctl --user restart pipewire wireplumber pipewire-pulse` (esto solo funciona con sesión real, por eso no se hizo en el chroot).
+- Si `wpctl status` no muestra ningún sink, revisa que no quede `pulseaudio` instalado en paralelo (compite por el mismo socket que `pipewire-pulse`).
+- Si `brightnessctl` pide permisos, confirma que el usuario pertenece al grupo `video` (`groups $USER_NAME`) y reinicia sesión para que el grupo tome efecto.
+- Si `brightnessctl -l` muestra el LED del teclado con un nombre distinto a `tpacpi::kbd_backlight`, corrige las dos líneas de `bindings.conf` con el nombre real antes de reiniciar.
+- En portátiles con audio Intel (HDA/SoundWire) que no reproducen nada, `firmware-sof-signed` suele ser la pieza faltante; revisa `dmesg | grep -i sof` tras instalarlo.
+- Si `brightnessctl -l` no muestra ningún dispositivo de tipo "leds", tu equipo probablemente no tiene teclado retroiluminado controlable por software; puedes borrar esas dos líneas de `bindings.conf`.
+
+------
+
+## ✅ HASTA AQUÍ DESDE EL LIVE — sistema mínimo funcional
+
+Con las Fases 1 a 8 completas (todavía dentro del chroot desde el entorno live), ya tienes: disco particionado y montado, sistema base, usuario y GRUB, red, escritorio gráfico con Firefox ESR, y audio/pantallas/teclado retroiluminado configurados. A partir de aquí **ya no necesitas seguir en el chroot**: reinicias, entras a tu escritorio real, y usas el propio sistema instalado (con su navegador y su red ya funcionando) para continuar con las fases futuras (Bluetooth, Snapper/Btrfs Assistant, Waybar, tema Nord, aplicaciones adicionales, verificación final).
+
+```bash
+exit          # sale del chroot
+umount -vR /mnt
 reboot
 ```
 
-Quita el USB/ISO de arranque cuando reinicie, para que arranque desde el
-disco.
+------
 
----
+## Apéndice: volver a entrar al sistema instalado desde otro Linux (rescate)
 
-## A partir de aquí: tu proyecto de sway
+Si necesitas arrancar desde un live USB para reparar el sistema instalado (por ejemplo, GRUB roto o un initramfs mal generado), estos son los pasos para volver a entrar por chroot.
 
-Cuando reinicies, llegarás a una consola de texto (sin entorno gráfico,
-exactamente como tu premisa original). Inicia sesión con tu usuario y
-desde aquí el flujo es el que ya conocías:
+Primero identifica tu disco (diagnóstico, no forma parte del bloque a pegar):
 
 ```bash
-git clone <tu-repositorio>
-cd debian-sway-v2
-./sway.sh
+lsblk -p
 ```
 
-`sway.sh` instalará sway y todo lo demás sobre esta base. No necesita
-ningún cambio por haber usado debootstrap en vez del instalador gráfico —
-para `sway.sh`, esto ya es "un Debian 13 con btrfs", que es exactamente
-lo que esperaba.
+Ajusta esta variable a tu disco real (edítala, no la pegues tal cual):
 
-La única diferencia es que `scripts/configure_snapper.sh` ahora encuentra
-los subvolúmenes `@home`, `@log`, etc. ya separados desde el origen, así
-que Snapper puede aprovecharlos correctamente sin que tengas que migrar
-nada después (a diferencia del plan de "modo rescue" que habíamos
-considerado antes para una instalación ya existente).
+```bash
+export DISK="/dev/sdX"
+```
 
----
+El resto se puede copiar y pegar sin más ediciones:
 
-## Apéndice: swap como partición vs. swap como archivo
+```bash
+case "$DISK" in
+  *nvme*|*mmcblk*) PARTSEP="p" ;;
+  *)               PARTSEP=""  ;;
+esac
+export EFI_PART="${DISK}${PARTSEP}1"
+export SWAP_PART="${DISK}${PARTSEP}2"
+export ROOT_PART="${DISK}${PARTSEP}3"
+export BTRFS_OPTS="defaults,noatime,space_cache=v2,compress=zstd:1"
 
-Por si te encuentras esta diferencia en otras guías (como el artículo
-original que revisamos), aquí está la comparación directa:
+mount -vo $BTRFS_OPTS,subvol=@ $ROOT_PART /mnt
 
-| | Partición de swap (lo que usamos aquí) | Archivo de swap dentro de btrfs |
-|---|---|---|
-| Dónde vive | Su propia partición en la tabla GPT | Un archivo regular dentro de un subvolumen `@swap` |
-| Redimensionar | Requiere reparticionar | Se agranda con `dd` + `mkswap`, sin tocar particiones |
-| Configuración para hibernar | Solo necesita el UUID de la partición | Necesita además un "offset" físico (`btrfs inspect-internal map-swapfile`), porque btrfs puede fragmentar el archivo en el disco |
-| Necesita `chattr +C` / desactivar compresión | No aplica (no es un archivo dentro de btrfs) | Sí, obligatorio, o el rendimiento y la integridad del swap se ven comprometidos |
-| Complejidad | Menor | Mayor |
+mount -vo $BTRFS_OPTS,subvol=@home    $ROOT_PART /mnt/home
+mount -vo $BTRFS_OPTS,subvol=@opt     $ROOT_PART /mnt/opt
+mount -vo $BTRFS_OPTS,subvol=@cache   $ROOT_PART /mnt/var/cache
+mount -vo $BTRFS_OPTS,subvol=@libvirt $ROOT_PART /mnt/var/lib/libvirt
+mount -vo $BTRFS_OPTS,subvol=@log     $ROOT_PART /mnt/var/log
+mount -vo $BTRFS_OPTS,subvol=@spool   $ROOT_PART /mnt/var/spool
+mount -vo $BTRFS_OPTS,subvol=@tmp     $ROOT_PART /mnt/var/tmp
+mount -v $EFI_PART /mnt/boot/efi
 
-Ambos métodos dan hibernación funcional. Elegimos partición porque es más
-simple y porque ya la tenías definida así en tu instalación anterior — no
-hay ninguna desventaja real para tu caso de uso por no usar el método de
-archivo.
+for dir in dev proc sys run; do
+    mount -v --rbind "/${dir}" "/mnt/${dir}"
+    mount -v --make-rslave "/mnt/${dir}"
+done
+mount -v -t efivarfs efivarfs /mnt/sys/firmware/efi/efivars
 
+chroot /mnt /bin/bash
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+source /root/instalacion.env   # recupera también $USER_NAME/$FULL_NAME si ya los definiste
+```
 
+**Sobre qué hacer una vez dentro:** esto solo te deja *entrar* al sistema instalado; no implica que siempre debas regenerar GRUB o el initramfs. Son ejemplos de las tareas típicas que resuelves desde aquí, condicionadas al problema que estés diagnosticando:
 
+- `update-grub` — solo si GRUB no arranca o no detecta el kernel (por ejemplo, tras un cambio de disco/partición o una actualización de kernel hecha sin regenerar el menú).
+- `update-initramfs -u -k all` — solo si cambiaste algo que afecta el arranque temprano (módulos, configuración de resume/hibernación, disco).
 
+Si solo entraste a revisar un archivo de configuración o los logs, no necesitas ejecutar ninguno de los dos.
 
-https://chatgpt.com/share/6a500595-f6f4-83e9-9519-540434208f43
+```bash
+update-grub
+update-initramfs -u -k all
+```
+
+Para salir limpiamente:
+
+```bash
+exit
+umount -vR /mnt
+reboot
+```
