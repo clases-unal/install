@@ -2,7 +2,7 @@
 
 Guía práctica, paso a paso, para instalar y dejar funcionando un escritorio Debian 13 con Btrfs, Sway y audio vía PipeWire. Cada fase se prueba en hardware real antes de pasar a la siguiente.
 
-**Estado de esta guía:** Fases 1-3 y 6-8 validadas en hardware real. Las Fases 4-5 tenían un problema de variables/`$PATH` que no sobrevivían un reingreso al chroot en una terminal nueva (ya corregido: cada fase ahora restaura `$PATH` y hace `source /root/instalacion.env` al inicio) — pendientes de re-validar con esta corrección. Las fases 9 a 13 (Bluetooth y demás integración de hardware, aplicaciones de escritorio, herramientas de gestión, personalización y verificación final) todavía no están desarrolladas y se añadirán en una próxima revisión.
+**Estado de esta guía:** Fases 1-8 validadas en hardware real (incluyendo la corrección de PATH/variables y el terminal `foot` que faltaba en la Fase 7). Fases 9-11 (Bluetooth/monitores/snapshots, aplicaciones de escritorio, Wlogout) recién redactadas con paquetes confirmados contra los repositorios de Trixie — pendientes de validar en tu hardware. Fases 12 (personalización: menús, temas, atajos) y 13 (verificación final) siguen en discusión activa y no están escritas todavía.
 
 **Nota de prioridad:** Bluetooth se dejó fuera de esta guía a propósito. Para el funcionamiento básico de la máquina, Internet importa más que Bluetooth, así que Bluetooth se atenderá junto con el resto de "integración de hardware" (Fase 9), *después* de tener ya red, escritorio y audio resueltos, no antes ni al mismo tiempo.
 
@@ -339,6 +339,15 @@ Al reiniciar, el sistema arranca directo a Debian con GRUB, con un usuario funci
 
 ### Comandos a ejecutar
 
+Primero, **edita únicamente estas dos líneas** con tu nombre y usuario reales (igual que `$DISK` en la Fase 1 — este bloque no lleva nada más para que no tengas que revisar de más al editarlo):
+
+```bash
+export FULL_NAME="Diego Salazar"
+export USER_NAME="dilusaper"
+```
+
+El resto se copia y pega tal cual, sin editar nada:
+
 ```bash
 # Por si volviste a entrar al chroot en una terminal nueva: restaura PATH y variables
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -351,10 +360,6 @@ RESUME=UUID=$SWAP_UUID
 EOF
 
 update-initramfs -u -k all
-
-# Ajusta estos dos valores a tu nombre y usuario reales (igual que $DISK en la Fase 1)
-export FULL_NAME="Diego Salazar"
-export USER_NAME="dilusaper"
 
 # Se guardan junto al resto de variables para que las Fases 7 y 8 (y cualquier
 # reingreso al chroot) los recuerden sin que tengas que volver a escribirlos
@@ -459,6 +464,7 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 source /root/instalacion.env
 
 apt install -y sway xwayland swaybg swaylock swayidle \
+               foot \
                brightnessctl upower acpi \
                libinput-tools pciutils usbutils \
                lightdm lightdm-gtk-greeter \
@@ -480,6 +486,9 @@ EOF
 cat > /home/$USER_NAME/.config/sway/config.d/variables.conf << 'EOF'
 # Variables reutilizables por el resto de los archivos de config.d/
 set $mod Mod4
+# Terminal por defecto para $mod+Return. Se actualiza a kitty en la Fase 10;
+# foot se mantiene instalado como respaldo aunque deje de ser el default.
+set $term foot
 EOF
 
 cat > /home/$USER_NAME/.config/sway/config.d/inputs.conf << 'EOF'
@@ -525,7 +534,7 @@ chown -R $USER_NAME:$USER_NAME /home/$USER_NAME/.config
 
 ### Cómo verificar
 
-Tras reiniciar, inicia sesión en LightDM eligiendo la sesión Sway. Deberías obtener un escritorio Sway vacío pero funcional, con el teclado en layout `us intl`, y poder abrir Firefox ESR desde una terminal (`firefox-esr &`) para navegar (usa la red configurada en la Fase 6).
+Tras reiniciar, inicia sesión en LightDM eligiendo la sesión Sway. Deberías obtener un escritorio Sway vacío pero funcional, con el teclado en layout `us intl`. Presiona **`$mod+Return`** (`Super+Enter`) y debe abrirse una terminal `foot`; desde ahí, `firefox-esr &` debe abrir el navegador (usa la red configurada en la Fase 6).
 
 ### Problemas comunes
 
@@ -645,7 +654,168 @@ reboot
 
 ------
 
-## Apéndice: volver a entrar al sistema instalado desde otro Linux (rescate)
+## Fase 9: Bluetooth, monitores y snapshots (integración de hardware)
+
+*Ya en el sistema real, arrancado desde el disco — no es chroot.*
+
+### Objetivo
+
+Dejar Bluetooth funcional con gestor gráfico, herramientas de gestión de monitores/color, y las herramientas de snapshots instaladas (sin política automática todavía).
+
+### Qué logra esta fase
+
+Bluetooth emparejable desde una interfaz gráfica, monitores gestionables gráficamente y con perfiles guardables, un perfil de color por defecto como red de seguridad, y Snapper/Btrfs Assistant listos para que definas tu propia política de snapshots cuando quieras (no antes).
+
+### Comandos a ejecutar
+
+```bash
+sudo apt update
+sudo apt install -y bluez bluez-tools blueman
+sudo systemctl enable --now bluetooth.service
+```
+
+```bash
+# kanshi: guarda/aplica perfiles de monitores automáticamente (útil si conectas
+# un externo). nwg-displays: GUI para acomodar monitores sin editar texto.
+# colord + gnome-color-manager: gestión de color con un perfil sRGB por defecto
+# como red de seguridad si una calibración manual futura sale mal.
+sudo apt install -y kanshi nwg-displays colord gnome-color-manager
+```
+
+```bash
+# Solo se instalan las herramientas. La política de snapshots (qué, cuándo,
+# cuántas conservar) se configura manualmente más adelante, a propósito.
+sudo apt install -y snapper btrfs-assistant
+```
+
+### Archivos modificados
+
+Ninguno de configuración todavía; solo paquetes instalados y el servicio `bluetooth` habilitado.
+
+### Cómo verificar
+
+```bash
+bluetoothctl show                 # el adaptador debe aparecer "Powered: yes"
+blueman-manager                   # abre la GUI; deberías poder buscar dispositivos
+nwg-displays                      # abre la GUI de monitores
+dpkg -L gnome-color-manager | grep bin/   # confirma el binario real antes de lanzarlo
+btrfs-assistant                   # abre y debe listar tus subvolúmenes @, @home, etc.
+```
+
+### Problemas comunes
+
+- Si `blueman-manager` no encuentra dispositivos, confirma `rfkill list` (el Bluetooth no debe aparecer "Soft blocked").
+- Si `btrfs-assistant` pide permisos, ejecútalo con `sudo` o autentica vía el diálogo de Polkit que debería aparecer.
+
+------
+
+## Fase 10: Aplicaciones de escritorio
+
+*Sistema real.*
+
+### Objetivo
+
+Kitty como terminal principal, Nemo como explorador de archivos, Flatpak con los portales necesarios y Bitwarden, soporte completo de AppImage, y Synaptic como gestor de paquetes gráfico.
+
+### Qué logra esta fase
+
+Un escritorio con las aplicaciones diarias resueltas con software maduro, sin scripts propios de por medio.
+
+### Comandos a ejecutar
+
+```bash
+sudo apt install -y kitty nemo
+```
+
+Actualiza la terminal por defecto de `$mod+Return` (definida en la Fase 7) para que ahora abra Kitty; `foot` se queda instalado como respaldo:
+
+```bash
+sed -i 's/^set \$term foot$/set $term kitty/' ~/.config/sway/config.d/variables.conf
+```
+
+```bash
+# Flatpak + portales necesarios para que apps en sandbox (Bitwarden incluido)
+# abran diálogos nativos y funcionen bien en Wayland/Sway sin escritorio completo.
+sudo apt install -y flatpak xdg-desktop-portal xdg-desktop-portal-wlr xdg-desktop-portal-gtk
+
+flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+flatpak install -y flathub com.bitwarden.desktop
+```
+
+```bash
+# Soporte base para ejecutar AppImages (la mayoría siguen enlazados a FUSE2)
+sudo apt install -y libfuse2 desktop-file-utils shared-mime-info
+
+# AppImageLauncher no está en los repos de Debian: se baja el .deb más reciente
+# publicado en GitHub. Verifica en https://github.com/TheAssassin/AppImageLauncher/releases
+# que el patrón de nombre de archivo siga siendo el mismo antes de confiar en el grep.
+AIL_URL=$(curl -s https://api.github.com/repos/TheAssassin/AppImageLauncher/releases/latest \
+  | grep "browser_download_url.*bullseye_amd64.deb" | cut -d '"' -f4)
+wget -O /tmp/appimagelauncher.deb "$AIL_URL"
+sudo apt install -y /tmp/appimagelauncher.deb
+```
+
+```bash
+sudo apt install -y synaptic
+```
+
+### Archivos modificados
+
+`~/.config/sway/config.d/variables.conf` (terminal por defecto).
+
+### Cómo verificar
+
+```bash
+kitty --version
+nemo                                    # abre el explorador de archivos
+flatpak run com.bitwarden.desktop &     # Bitwarden debe abrir con diálogos nativos
+synaptic                                # gestor gráfico de paquetes
+```
+
+Descarga cualquier `.AppImage` de prueba, dale doble clic desde Nemo: AppImageLauncher debe ofrecer integrarlo (crear su entrada en el menú) automáticamente.
+
+### Problemas comunes
+
+- Si el `grep` del `.deb` de AppImageLauncher no encuentra nada, revisa manualmente la página de releases: puede que hayan cambiado el nombre del asset (por ejemplo, a otra versión base de Ubuntu/Debian).
+- Si Bitwarden (Flatpak) no abre el selector de archivos con el estilo esperado, confirma que `xdg-desktop-portal-gtk` quedó instalado y reinicia sesión.
+
+------
+
+## Fase 11: Gestión de sesión (Wlogout)
+
+*Sistema real.*
+
+### Objetivo
+
+Un único punto gráfico para bloquear, suspender, cerrar sesión, reiniciar o apagar — sin duplicar esa lógica en ningún otro menú.
+
+### Comandos a ejecutar
+
+```bash
+sudo apt install -y wlogout
+```
+
+```bash
+# Reemplaza el atajo de salida de Sway por defecto (que solo confirma "salir de
+# Sway") para que en su lugar abra Wlogout con todas las opciones.
+cat >> ~/.config/sway/config.d/bindings.conf << 'EOF'
+
+# --- Gestión de sesión ---
+bindsym $mod+Shift+e exec wlogout
+EOF
+```
+
+### Cómo verificar
+
+```bash
+wlogout   # deben aparecer los íconos de bloquear/suspender/cerrar sesión/reiniciar/apagar
+```
+
+### Problemas comunes
+
+- Si los íconos de Wlogout salen sin estilo (cuadros de texto en vez de íconos), es normal en su tema por defecto hasta que lo personalicemos en la fase de estética.
+
+------
 
 Si necesitas arrancar desde un live USB para reparar el sistema instalado (por ejemplo, GRUB roto o un initramfs mal generado), estos son los pasos para volver a entrar por chroot.
 
